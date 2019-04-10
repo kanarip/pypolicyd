@@ -133,7 +133,7 @@ class PolicyRequest:
             Rates.created >= (now-hour)
         ).first()[0] or 0
 
-        if num_messages > 10:
+        if num_messages > args.rl_msgs:
             defer(
                 "Account %s is at %d messages per hour now, cool down" % (
                     self.sender, num_messages
@@ -142,7 +142,7 @@ class PolicyRequest:
 
             return
 
-        if num_recipients > 100:
+        if num_recipients > args.rl_rcpts:
             defer(
                 "Account %s is at %r recipients per hour now, cool down" % (
                     self.sender, num_recipients
@@ -339,6 +339,26 @@ if __name__ == '__main__':
         '--ratelimit',
         dest='ratelimit',
         action='store_true'
+    )
+
+    parser.add_argument(
+        '--rl-msgs',
+        dest='rl_msgs',
+        action='store',
+        default=10,
+        type=int,
+        metavar='N',
+        help='Number of messages per hour'
+    )
+
+    parser.add_argument(
+        '--rl-rcpts',
+        dest='rl_rcpts',
+        action='store',
+        default=100,
+        type=int,
+        metavar='N',
+        help='Number of recipients per hour'
     )
 
     parser.add_argument(
