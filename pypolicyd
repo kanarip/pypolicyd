@@ -1,0 +1,394 @@
+#!/bin/env python
+"""
+    A simple policy daemon for Postfix.
+"""
+import argparse
+import datetime
+import hashlib
+import os
+import sys
+import time
+
+from sqlalchemy import Column
+from sqlalchemy import DateTime
+from sqlalchemy import Integer
+from sqlalchemy import MetaData
+from sqlalchemy import String
+
+from sqlalchemy import create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.sql import func
+from sqlalchemy.orm import sessionmaker
+
+try:
+    from configparser import ConfigParser
+except ImportError:
+    from ConfigParser import SafeConfigParser as ConfigParser
+
+# pylint: disable=invalid-name
+metadata = MetaData()
+
+DeclarativeBase = declarative_base()
+
+WL_TYPE_DOMAIN = 1 << 0
+WL_TYPE_RATE = 1 << 1
+
+
+class PolicyRequest:
+    """
+        A holder of policy request instances.
+    """
+    db = None
+    recipients = []
+    sender = None
+
+    def __init__(self, request):
+        """
+            Initialize a policy request, usually in RCPT protocol state.
+        """
+        if 'sender' in request:
+            self.sender = normalize_address(request['sender'])
+
+        if 'recipient' in request:
+            request['recipient'] = normalize_address(request['recipient'])
+
+            self.recipients.append(request['recipient'])
+
+    def add_request(self, request):
+        """
+            Add an additional request from an instance to the existing instance
+        """
+        # Normalize email addresses (they may contain recipient delimiters)
+        if 'recipient' in request:
+            request['recipient'] = normalize_address(request['recipient'])
+
+            if not request['recipient'].strip() == '':
+                self.recipients.append(request['recipient'])
+
+    def check_rate(self):
+        """
+            Check the rates at which this sender is hitting our mailserver.
+        """
+        self.db = init_db()
+
+        if self.sender != '':
+            if Whitelist.exists(self.sender):
+                dunno_final()
+
+            if Whitelist.exists(self.sender.split('@')[1]):
+                dunno_final()
+
+        # Create a message ID from the recipients -- the MAIL, RCPT and DATA
+        # stages do not allow us to get to a message ID, but internal mail
+        # exchangers will happily retry delivery causing us to hit duplicates.
+        #
+        # NOTE: The recipients should be sorted.
+        message_id = hashlib.sha512(
+            b','.join(
+                [x.encode() for x in sorted(list(set(self.recipients)))]
+            )
+        ).hexdigest()
+
+        now = datetime.datetime.utcnow()
+        hour = datetime.timedelta(hours=1)
+        queue_lifetime = datetime.timedelta(days=5)
+
+        messages = self.db.query(Rates).filter(
+            Rates.sender == self.sender,
+            Rates.message_id == message_id,
+            Rates.created >= (now-queue_lifetime)
+        ).all()
+
+        if messages:
+            for message in messages:
+                message.created = now
+            self.db.commit()
+
+        num_messages = self.db.query(Rates).filter(
+            Rates.sender == self.sender,
+            Rates.created >= (now-hour)
+        ).count()
+
+        num_recipients = self.db.query(func.sum(Rates.count)).filter(
+            Rates.sender == self.sender,
+            Rates.created >= (now-hour)
+        ).first()[0] or 0
+
+        if num_messages > 10:
+            defer(
+                "Account %s is at %d messages per hour now, cool down" % (
+                    self.sender, num_messages
+                )
+            )
+
+            return
+
+        if num_recipients > 100:
+            defer(
+                "Account %s is at %r recipients per hour now, cool down" % (
+                    self.sender, num_recipients
+                )
+            )
+
+            return
+
+        if not messages:
+            rate = Rates(self.sender, message_id, len(self.recipients))
+            self.db.add(rate)
+            self.db.commit()
+
+        self.db.close()
+
+        dunno_final()
+
+
+# pylint: disable=too-few-public-methods
+class Rates(DeclarativeBase):
+    """
+        Database table for rates
+    """
+    __tablename__ = 'policy_rates'
+
+    id = Column(Integer, primary_key=True)
+    sender = Column(String(256), index=True, nullable=False)
+    message_id = Column(String(128), index=True, nullable=False)
+    count = Column(Integer, nullable=False, default=1)
+    created = Column(
+        DateTime,
+        nullable=False,
+        default=datetime.datetime.utcnow()
+    )
+
+    def __init__(self, sender, message_id, count=1):
+        self.sender = sender.lower()
+        self.message_id = message_id.lower()
+        self.count = count
+
+
+# pylint: disable=too-few-public-methods
+class Whitelist(DeclarativeBase):
+    """
+        Whitelist entries.
+    """
+    __tablename__ = 'policy_whitelist'
+    id = Column(Integer, primary_key=True)
+    address = Column(String(256), index=True, nullable=False)
+    wl_type = Column(Integer, nullable=False, default=0)
+    last_changed = Column(
+        DateTime,
+        nullable=False,
+        default=datetime.datetime.utcnow()
+    )
+
+    def __init__(self, address, wl_type):
+        self.address = normalize_address(address)
+        self.wl_type = wl_type
+
+    @classmethod
+    def exists(cls, address):
+        """
+            Check if an entry exists.
+        """
+        _db = init_db()
+        entries = _db.query(Whitelist).filter(
+            Whitelist.address == address
+        ).count()
+
+        if entries > 0:
+            return True
+
+        return False
+
+
+def defer(message):
+    """
+        Defer a message, meaning causing a temporary delivery failure.
+    """
+    print("action=DEFER %s\n\n" % (message))
+    sys.stdout.flush()
+
+
+def dunno():
+    """
+        Skip judgement. Used in MAIL and RCPT protocol states.
+    """
+    print("action=DUNNO\n\n")
+    sys.stdout.flush()
+
+
+def dunno_final():
+    """
+        Skip judgement and exit.
+    """
+    print("action=DUNNO\n\n")
+    sys.stdout.flush()
+    sys.exit(0)
+
+
+def init_db():
+    """
+        Returns a SQLAlchemy Session() instance.
+    """
+
+    try:
+        db_uri = config.get(
+            'DEFAULT',
+            'db_uri',
+            fallback='sqlite:////run/postfix/policyd.db'
+        )
+
+    except TypeError:
+        db_uri = config.get('DEFAULT', 'db_uri')
+        if db_uri is None:
+            db_uri = 'sqlite:////run/postfix/policyd.db'
+
+    engine = create_engine(db_uri)
+
+    DeclarativeBase.metadata.create_all(engine)
+
+    Session = sessionmaker(bind=engine)
+
+    _db = Session()
+
+    return _db
+
+
+def normalize_address(email_address):
+    """
+        Parse an address; Strip off anything after a recipient delimiter.
+    """
+    if len(email_address.split("+")) > 1:
+        # Take the first part split by recipient delimiter and the last part
+        # split by '@'.
+        return "%s@%s" % (
+            email_address.split("+")[0].lower(),
+            # TODO: Under some conditions, the recipient may not be fully
+            # qualified. We'll cross that bridge when we get there, though.
+            email_address.split('@')[1].lower()
+        )
+
+    return email_address.lower()
+
+
+def read_request_input():
+    """
+        Read a single policy request from sys.stdin, and return a dictionary
+        containing the request.
+    """
+
+    start_time = time.time()
+
+    request = {}
+
+    end_of_request = False
+
+    while not end_of_request:
+        if (time.time() - start_time) >= 10:
+            sys.exit(0)
+
+        line = sys.stdin.readline()
+        if line.strip() == '':
+            if 'request' in request:
+                end_of_request = True
+        else:
+            line = line.strip()
+            request[line.split('=')[0]] = '='.join(line.split('=')[1:]).lower()
+
+    return request
+
+
+if __name__ == '__main__':
+    default_config = '/etc/pypolicyd.ini'
+
+    if not os.path.exists(default_config):
+        default_config = os.path.join(
+            os.path.dirname(__file__),
+            'pypolicyd.ini'
+        )
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        '--config',
+        dest='config',
+        action='store',
+        default=default_config,
+        metavar='/path/to/file'
+    )
+
+    parser.add_argument(
+        '--ratelimit',
+        dest='ratelimit',
+        action='store_true'
+    )
+
+    parser.add_argument(
+        '--wl-add-rl',
+        dest='wl_add_rl',
+        action='store',
+        metavar='EMAIL|DOMAIN',
+        help='Add email or domain to ratelimit whitelist.'
+    )
+
+    parser.add_argument(
+        '--wl-del-rl',
+        dest='wl_del_rl',
+        action='store',
+        metavar='EMAIL|DOMAIN',
+        help='Remove email or domain from ratelimit whitelist.'
+    )
+
+    args = parser.parse_args()
+
+    config = ConfigParser()
+    config.read(args.config)
+
+    if args.wl_add_rl:
+        db = init_db()
+        wl_entry = Whitelist(args.wl_add_rl, WL_TYPE_RATE)
+        db.add(wl_entry)
+        db.commit()
+        print(
+            "Successfully added whitelist entry for %s" % (
+                args.wl_add_rl
+            )
+        )
+
+        sys.exit(0)
+
+    if args.wl_del_rl:
+        db = init_db()
+        wl_entry = db.query(Whitelist).filter_by(sender=args.wl_del_rl).first()
+
+        if wl_entry:
+            db.delete(wl_entry)
+            db.commit()
+
+            print(
+                "Successfully removed whitelist entry for %s" % (
+                    args.wl_del_rl
+                )
+            )
+
+            sys.exit(0)
+
+    policy_requests = {}
+
+    while True:
+        policy_request = read_request_input()
+
+        instance = policy_request['instance']
+
+        if instance in policy_requests:
+            policy_requests[instance].add_request(policy_request)
+        else:
+            policy_requests[instance] = PolicyRequest(policy_request)
+
+        protocol_state = policy_request['protocol_state'].strip().lower()
+
+        if not protocol_state == 'data':
+            dunno()
+
+        else:
+            if args.ratelimit:
+                policy_requests[instance].check_rate()
